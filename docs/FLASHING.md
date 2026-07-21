@@ -101,12 +101,21 @@ openocd --version
 
 ## 3. Wiring the debugger
 
+The header is the row of through-holes **above the MCU**, silkscreened
+`GND CLK DIO 3.3V` on the component side. Photographs of both sides, the
+observed pigtail colour map, and the board layout are in the
+[README's board section](../README.md#where-to-solder-swd).
+
 | ST-Link | Board header |
 |---|---|
-| SWDIO | `DIO` |
-| SWCLK | `CLK` |
+| SWDIO | `DIO` (→ `PA13`) |
+| SWCLK | `CLK` (→ `PA14`) |
 | GND | `GND` |
 | 3.3 V | `3.3V` |
+
+> **Do not use the gold through-holes near the crystal on the back side** —
+> those are the power switch pins. The 3.3 V lead is also easier to take from
+> the rail beside the tantalum than from the header hole itself.
 
 `BOOT0` must be **LOW** for the MCU to boot from flash — leave the strap alone.
 If you ever manage to lock SWD by misconfiguring `PA13`/`PA14`, pulling `BOOT0`

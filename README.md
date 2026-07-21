@@ -101,6 +101,76 @@ floating-point unit and no math library**, which shapes most of the design.
 Full pin map, the LQFP32 ledger, and the board survey are in
 [`docs/heli.md`](docs/heli.md).
 
+## The board
+
+![Component side of the V977R-V6 flight controller](docs/board_photos_2026-07-15/12-53-45.jpg)
+
+*Component side, photographed after the brushed motor drive was removed.*
+
+Only three ICs and a power stage. Held with the `B+`/`B−` battery pads at the
+top right and the 26 MHz can at the top left, the layout is:
+
+```
+   26 MHz can                 inductor + tantalum        B+ / B−
+   (belongs to CC2500)                                   pads
+        ┌───────────────────────────────────────────────────┐
+        │  [26MHz]        ▪ ▪ ▪ ▪  ← SWD through-holes      │
+        │                   GND CLK DIO 3V3                 │
+        │  ┌────────┐                                       │
+        │  │ CC2500 │        ┌──────────┐          ▭  servo │
+        │  └────────┘        │ STM32F031│          ▭  / ESC │
+        │                    │  K6 LQFP │          ▭  conns │
+        │  ┌────────┐        └──────────┘                   │
+        │  │  IMU   │                                       │
+        │  └────────┘                                       │
+        └───────────────────────────────────────────────────┘
+```
+
+The IMU is silkscreened `InvenSense MPU-6050A`, but it answers `WHO_AM_I` with
+`0x98` — it is an **ICM-20689**. Register-compatible, so only the accepted ID
+differs. Trust the die, not the marking.
+
+**MCU orientation.** The pin-1 dot sits at the corner nearest the ST logo. With
+the board held as above, pin 1 is the **bottom-left** corner: pins 1–8 run along
+the bottom edge left to right, 9–16 up the right edge, 17–24 along the top edge
+right to left, 25–32 down the left edge. Cross-checked against known nets —
+`PB3/PB4/PB5` head toward the radio, `PB6/PB7` toward the IMU, `PA0–PA3` fan out
+to the servo connectors.
+
+### Where to solder SWD
+
+The debug header is the row of **through-holes above the MCU**, silkscreened
+`GND CLK DIO 3.3V` on the component side. Four wires, and that is the whole job.
+
+![Back side with the SWD pigtail attached](docs/board_photos_2026-07-15/12-54-08.jpg)
+
+*Back side. The `16.000 MHz` crystal is `X1`, the MCU's own oscillator, sitting
+directly under the chip. The four-wire SWD pigtail is tacked to the back of the
+header holes; the black and red pair at the top is the battery.*
+
+On the reference board the pigtail was soldered from the back, with this colour
+map — **beep it out before trusting these**, they are read off a photograph:
+
+| Wire | Signal |
+|---|---|
+| white | `GND` |
+| green | `CLK` (SWCLK → `PA14`) |
+| orange | `DIO` (SWDIO → `PA13`) |
+| red | `3.3 V` |
+
+Two things worth knowing before the iron comes out:
+
+- The red 3.3 V lead was picked up **from the rail beside the tantalum, not from
+  the header hole** — easier to land and mechanically sturdier.
+- **The gold through-holes near the crystal on the back are the power switch
+  pins, not SWD.** They look inviting and they are the wrong holes.
+
+The back also carries the `Futaba v2.0` silkscreen and a model checklist —
+`K100R / K110R / K123R / K124R / A600R / A430R` — which is the factory using one
+PCB across a family and picking firmware per model. Read
+[docs/FLASHING.md](docs/FLASHING.md#1-what-it-can-be-flashed-to) before assuming
+that makes this firmware portable to those aircraft.
+
 ## Status
 
 Flying. Cyclic runs the attitude cascade described above; the tail holds
