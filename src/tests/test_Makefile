@@ -1,0 +1,16 @@
+CC = arm-none-eabi-gcc
+OBJCOPY = arm-none-eabi-objcopy
+
+CFLAGS = -mcpu=cortex-m0 -mthumb -Os -ffreestanding -nostdlib
+LDFLAGS = -T linker.ld -nostartfiles -nodefaultlibs
+
+all: test_blink.bin
+
+test_blink.elf: test_blink.c
+	$(CC) $(CFLAGS) -o test_blink.elf test_blink.c $(LDFLAGS)
+
+test_blink.bin: test_blink.elf
+	$(OBJCOPY) -O binary test_blink.elf test_blink.bin
+
+clean:
+	rm -f *.elf *.bin

@@ -1,0 +1,26 @@
+# Build output
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+build/
+
+# Debugger / analysis scratch
+*.log
+openocd*.txt
+*.tcl.out
+
+# Reverse-engineering working material — deliberately NOT published.
+# See README: the stock image is not redistributed, only its SHA-256.
+reverse_engineering/
+*_ghidra/
+*decompiled*
+firmware_dump*
+
+# OS / editor
+.DS_Store
+__pycache__/
+*.pyc
