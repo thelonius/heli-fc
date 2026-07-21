@@ -144,10 +144,15 @@ to the servo connectors.
 The debug header is the row of **through-holes above the MCU**, silkscreened
 `GND CLK DIO 3.3V` on the component side. Four wires, and that is the whole job.
 
+![The SWD header located on the component side](docs/images/swd-locator.jpg)
+
+*Where to look: the four holes sit between the radio and the MCU, just below the
+FET pair.*
+
 ![The SWD header, silkscreened GND CLK DIO 3.3V](docs/images/swd-header.jpg)
 
-*The four holes and their labels, next to the STM32. This is the whole debug
-interface — there is nothing else to connect.*
+*Closer in — the holes and their labels, right beside the STM32. This is the
+whole debug interface; there is nothing else to connect.*
 
 ![Back side with the SWD pigtail attached](docs/images/board-back.jpg)
 
