@@ -16,8 +16,8 @@ need, how to build, flash, verify, and configure a transmitter.
 
 ## ⚠️ Safety
 
-**This flies a real aircraft with carbon blades at several thousand RPM. Treat
-every build as unverified until you have proven it on your own bench.**
+**This flies a real aircraft with a rotor spinning at several thousand RPM.
+Treat every build as unverified until you have proven it on your own bench.**
 
 - Nothing here has been validated for anyone else's airframe, ESC, or transmitter.
 - There is deliberately **no arming gate**: the motors run whenever throttle-cut
@@ -103,9 +103,11 @@ Full pin map, the LQFP32 ledger, and the board survey are in
 
 ## The board
 
-![Component side of the V977R-V6 flight controller](docs/board_photos_2026-07-15/12-53-45.jpg)
+![Component side of the V977R-V6 flight controller](docs/images/board-front.jpg)
 
-*Component side, photographed after the brushed motor drive was removed.*
+*Component side. Every IC is legible here: `CC2500` upper left, the `F031K6`
+STM32 in the middle, `INVENSENSE MPU-6050A` lower left, and the `CMS4576` FET
+pair upper right — the brushed motor drive this firmware replaces.*
 
 Only three ICs and a power stage. Held with the `B+`/`B−` battery pads at the
 top right and the 26 MHz can at the top left, the layout is:
@@ -142,7 +144,12 @@ to the servo connectors.
 The debug header is the row of **through-holes above the MCU**, silkscreened
 `GND CLK DIO 3.3V` on the component side. Four wires, and that is the whole job.
 
-![Back side with the SWD pigtail attached](docs/board_photos_2026-07-15/12-54-08.jpg)
+![The SWD header, silkscreened GND CLK DIO 3.3V](docs/images/swd-header.jpg)
+
+*The four holes and their labels, next to the STM32. This is the whole debug
+interface — there is nothing else to connect.*
+
+![Back side with the SWD pigtail attached](docs/images/board-back.jpg)
 
 *Back side. The `16.000 MHz` crystal is `X1`, the MCU's own oscillator, sitting
 directly under the chip. The four-wire SWD pigtail is tacked to the back of the
@@ -164,6 +171,10 @@ Two things worth knowing before the iron comes out:
   the header hole** — easier to land and mechanically sturdier.
 - **The gold through-holes near the crystal on the back are the power switch
   pins, not SWD.** They look inviting and they are the wrong holes.
+
+Full-resolution originals of the whole survey, including backlit shots usable
+for tracing tracks, are in
+[`docs/board_photos_2026-07-15/`](docs/board_photos_2026-07-15).
 
 The back also carries the `Futaba v2.0` silkscreen and a model checklist —
 `K100R / K110R / K123R / K124R / A600R / A430R` — which is the factory using one
