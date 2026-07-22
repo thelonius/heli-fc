@@ -28,6 +28,20 @@ typedef struct {
 
 extern Orientation_t g_orientation;
 
+/* Ground gyro auto-trim, reported outward so the pilot gets a LED and SWD gets
+ * a post-mortem. The trim is what re-zeroes the gyro before every takeoff, so
+ * "did it actually run" is flight-safety information, not debug trivia — it was
+ * invisible until 2026-07-22, when g_gyro_trim_count turned out to be 0 across a
+ * whole session and nobody could have known from outside the board. */
+#define GT_NONE    0   /* no window has finished yet (first ~1s after power-up) */
+#define GT_MOVING  1   /* windows keep getting rejected, NO zero captured — do not fly */
+#define GT_OK      2   /* last window accepted; g_gyro_trim_dps is fresh */
+#define GT_STALE   3   /* a zero is held, but the latest window saw motion */
+extern volatile uint8_t  g_gyro_trim_state;   /* GT_* */
+extern volatile uint16_t g_gyro_trim_count;   /* accepted windows (sticky: ever calibrated) */
+extern volatile uint16_t g_gyro_trim_rej;     /* rejected windows */
+extern volatile float    g_gyro_trim_dps[3];
+
 void Orientation_Init(void);
 /* dt_s = seconds since the previous call. use_accel=1 when sample carries a
  * fresh accelerometer read (full MPU6500_GetSample); 0 for a gyro-only tick
