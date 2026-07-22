@@ -93,8 +93,14 @@
  * Stabilize_Reset() exactly when throttle_is_idle(), which zeroes the target
  * below. That IS Math_QuaternionIdentity() at throttle minimum.
  *
- * Modes 0/1 stay for the planned idle-up split (Rotorflight-style rate flying
- * with integral decay on the aerobatic switch, stock attitude in normal). */
+ * THIS IS THE BUILD-TIME CONTROL-LAW FLAG, AND IT IS MEANT TO APPLY TO BOTH
+ * FLIGHT MODES (pilot's call 2026-07-22). The earlier plan was a split —
+ * attitude in normal, rate on idle-up — but flying two different laws on one
+ * switch means the machine changes character mid-air, and rate mode has not
+ * been flown at all yet. So: flash one law and use it everywhere; idle-up is
+ * meant to differ ONLY in the collective curve. That curve split is NOT
+ * implemented — it needs an idle-up detector, and the one attempt at inferring
+ * it was reverted the same day (see the note above COLL_NEG_FRAC in main.c). */
 #define STAB_CYCLIC_RATE_MODE  2
 
 /* ---- MODE 2 (stock attitude) ---------------------------------------------
@@ -142,23 +148,26 @@
 #define STAB_ATT_PITCH_TRIM_DEG  0.0f
 
 /* Stick DEADBAND around centre, us, applied to the TARGET INTEGRATOR only.
- * MANDATORY, not a comfort feature: an integrator has infinite DC gain, so any
- * resting stick offset — trim, pot slop, a stick that just doesn't sit at
- * 1520 — is integrated forever and walks the target to its rails with the
- * pilot's hands off the sticks. Measured on this airframe 2026-07-16: roll rest
- * = 1528 (+8us), pitch rest = 1508 (-12us), which drove the target at 12 and 18
- * deg/s until pitch pinned at the -35 clamp and roll at the leash. That was the
- * "swash drifts off on its own once stab engages" report.
+ * REMOVED 2026-07-20 (pilot: "убрать мёртвую зону с циклики"), verified safe
+ * first: TX trims zeroed by the pilot, live stick center read over SWD with
+ * signal CONNECTED = exactly 1520/1520 on both axes, no residual offset.
  *
- * 20us ~= 6% of the 330us throw. Sized over the measured offsets with margin,
- * and the offset is SUBTRACTED past the edge so response stays continuous
- * (no jump from nothing to full slew). RATE mode never needed this: an offset
- * there is just a small constant rate command, and nothing accumulates.
+ * History, so this isn't re-added blind: an integrator has infinite DC gain,
+ * so any resting stick offset is integrated forever and walks the target to
+ * its rails hands-off. Measured 2026-07-16: roll rest 1528 (+8us), pitch rest
+ * 1508 (-12us) drove the target at 12/18 deg/s until it pinned the clamp/leash
+ * — the "swash drifts off on its own" report. The deadband was always a
+ * BACKSTOP for that offset, never the cure (the cure is trimming the TX, which
+ * is what actually fixed it this time).
  *
- * The deadband is a backstop, not the cure — trim the TX so the sticks actually
- * read 1520 (watch g_sfhss.data[0]/[1] over SWD). Anything left inside the band
- * simply never moves the target. */
-#define STAB_ATT_STICK_DEADBAND_US  20.0f
+ * RISK IF IT RETURNS: pot slop can drift the center over time/temperature
+ * without the TX trim changing, and there is no deadband to catch it now. The
+ * blackbox already carries the tell for free — in a steer=0 hold window,
+ * roll_tgt/pitch_tgt creeping away from ~0 over many seconds (not a one-off
+ * jump) means an offset crept back in. Re-trim the TX first; only bring the
+ * deadband back if that doesn't hold, and re-measure the offset rather than
+ * reusing 20us blind. */
+#define STAB_ATT_STICK_DEADBAND_US  0.0f
 
 /* Target clamp, degrees. Without it, holding the stick winds the target past
  * vertical and the loop dutifully tries to fly there. Also the reason the

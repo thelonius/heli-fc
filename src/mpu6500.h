@@ -100,7 +100,12 @@ void MPU6500_Init(void);                         /* GPIO setup + address probe +
 uint8_t MPU6500_ReadReg(uint8_t addr);
 void MPU6500_WriteReg(uint8_t addr, uint8_t value);
 void MPU6500_ReadRaw(MPU6500_Raw_t *out);         /* one burst read of accel+gyro (14 bytes) */
-void MPU6500_CalibrateGyro(uint16_t samples);     /* airframe must be still; fills g_mpu_cal */
+/* Stillness-validated (2026-07-20, stock's scheme): `samples` = CONSECUTIVE
+ * still reads required; motion discards the accumulator and restarts. Slow
+ * red blink = measuring, fast flicker = disturbed. See the .c for the story. */
+void MPU6500_CalibrateGyro(uint16_t samples);
+extern volatile uint16_t g_gyro_cal_restarts;  /* motion events during cal (SWD) */
+extern volatile uint8_t  g_gyro_cal_timeout;   /* 1 = never settled, EMA fallback used */
 void MPU6500_GetSample(MPU6500_Sample_t *out);    /* raw read + bias correction + scaling */
 void MPU6500_GetGyroSample(MPU6500_Sample_t *out); /* gyro only (6B burst): fills gyro_*_dps, accel fields untouched */
 

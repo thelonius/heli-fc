@@ -27,6 +27,8 @@ volatile float g_accel_last_magsq;
  * should tick up while sitting at idle with signal, freeze in flight). */
 volatile float g_gyro_trim_dps[3];      /* [x,y,z], SUBTRACTED from raw gyro */
 volatile uint16_t g_gyro_trim_count;    /* windows that refreshed the trim */
+volatile uint16_t g_gyro_trim_rej;      /* windows thrown away as "not still" */
+volatile uint8_t  g_gyro_trim_state;    /* GT_* below — drives the red LED */
 static float s_gt_sum[3], s_gt_min[3], s_gt_max[3];
 static uint16_t s_gt_n;
 
@@ -180,6 +182,13 @@ void Orientation_Update(const MPU6500_Sample_t *sample, float dt_s, uint8_t use_
             if (still) {
                 for (int i = 0; i < 3; i++) g_gyro_trim_dps[i] = m[i];
                 g_gyro_trim_count++;
+                g_gyro_trim_state = GT_OK;
+            } else {
+                g_gyro_trim_rej++;
+                /* MOVING vs STALE distinguishes "no zero at all yet" from "the
+                 * zero in hand is fine, I just can't refresh it right now" —
+                 * the first must block a takeoff, the second must not. */
+                g_gyro_trim_state = g_gyro_trim_count ? GT_STALE : GT_MOVING;
             }
             s_gt_n = 0;
         }

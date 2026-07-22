@@ -231,7 +231,15 @@ __attribute__((unused)) static uint32_t elapsed_us(uint32_t since, uint32_t now)
 /* No on-chip mode handling (2026-07-12): the TX applies idle-up/cut onto
  * data[CH_THROTTLE] itself (see CH_THROTTLE note) — the old MODE_IDLEUP_THRESH
  * check against data[CH_MODE] misread a static 1410 as "idle-up engaged" and
- * permanently vetoed the arming interlock. */
+ * permanently vetoed the arming interlock.
+ *
+ * An INFERRED detector was written and reverted 2026-07-22 (throttle pinned
+ * full while collective sits lower = idle-up). It simulated correctly, but it
+ * was built on the 2026-07-12 bench NOTE rather than on a fresh measurement of
+ * what the channels actually do when the switch is flipped — inference first,
+ * data second, which is backwards. Measure the channels against the switch
+ * before writing any detector; the note may also simply be incomplete about
+ * which channel carries the switch. */
 
 /* Collective PITCH CURVE — linear, symmetric about mid-stick, applied in BOTH
  * modes. coll = COLL_DIR*(stick-0.5)*2*COLL_TRAVEL, added to all three swash
@@ -604,7 +612,12 @@ void Reset_Handler(void) {
 
 #if IMU_POLL_ENABLE
     MPU6500_Init();
-    if (g_mpu_ok) MPU6500_CalibrateGyro(200); /* ~200ms, airframe must be still */
+    /* 512 CONSECUTIVE still samples (~2.5s when undisturbed) — the count only
+     * advances while the airframe is provably motionless, so unlike the old
+     * blind 200-mean this cannot freeze handling motion into the zero
+     * (flight 12: -7.2 dps of power-up movement became a 25-deg attitude lie).
+     * Slow red blink = measuring; fast flicker = disturbed, restarting. */
+    if (g_mpu_ok) MPU6500_CalibrateGyro(512);
     Orientation_Init();
     Stabilize_Init();
 #endif
@@ -677,12 +690,30 @@ void Reset_Handler(void) {
                     imu_stage = 1;
                 }
             } else if (imu_stage == 1) {
-                /* on_ground for the yaw auto-trim: throttle sitting at idle
-                 * with live signal. Signal required — with the TX off the
-                 * machine might be carried around, and idle can't be told
-                 * from failsafe. */
+                /* on_ground for the gyro auto-trim = THE MAIN ROTOR IS NOT
+                 * TURNING. Gated on g_motor_slew (the real, slewed drive), not
+                 * on link state.
+                 *
+                 * It used to require SFHSS_HasSignal too, reasoning that with
+                 * the TX off the machine might be carried and idle couldn't be
+                 * told from failsafe. Measured 2026-07-22 that this cost us the
+                 * mechanism entirely: g_gyro_trim_count read 0 across a whole
+                 * flight session — the one genuinely quiet window (powered,
+                 * sitting, TX not on yet) was gated OUT, and once the TX is on
+                 * the machine is already being readied to fly. So the boot zero
+                 * was never refreshed, which is exactly what this trim exists to
+                 * prevent. On the bench with the TX on it counts happily once a
+                 * second, so the logic was never broken — only unreachable.
+                 *
+                 * Signal was also the wrong discriminator: "being carried" is
+                 * already caught by the stillness test inside (spread over all
+                 * three axes), and a failsafe IN FLIGHT reads throttle as idle,
+                 * so the old condition would have opened the gate airborne.
+                 * Rotor-not-turning cannot: in flight the slew is high, and after
+                 * a failsafe it decays over seconds while the airframe is moving
+                 * enough for the stillness test to reject anyway. */
                 Orientation_Update(&imu_sample, imu_dt_s, imu_use_accel,
-                                   SFHSS_HasSignal(now) && throttle_is_idle());
+                                   g_motor_slew < 0.05f);
 #if RATE_LOG
                 {
                     static uint8_t rl_decim;
@@ -961,27 +992,55 @@ void Reset_Handler(void) {
         }
 #endif
 
+        /* BLUE = link only. */
         switch (g_sfhss.phase) {
-        case SFHSS_PH_CONNECTED:
-            LED_SetBlue(1);
-            /* Red while connected: solid = disarmed (interlock builds only);
-             * SLOW BLINK = IMU DEAD (g_mpu_ok=0) — stabilization silently off,
-             * DO NOT FLY. Added 2026-07-16 after a brownout reboot left the
-             * IMU down with no outward sign. Dark = armed and healthy. */
-            if (!motor_armed)       LED_SetRed(1);
-            else if (!g_mpu_ok)     LED_SetRed((now >> 17) & 1);
-            else                    LED_SetRed(0);
-            break;
-        case SFHSS_PH_FINDING:
-            /* slow blue blink while searching for a transmitter */
-            LED_SetBlue((now >> 17) & 1);
-            LED_SetRed(1);
-            break;
-        default:
-            /* reconnecting: fast blue blink */
-            LED_SetBlue((now >> 15) & 1);
-            LED_SetRed(1);
-            break;
+        case SFHSS_PH_CONNECTED: LED_SetBlue(1);                    break;
+        case SFHSS_PH_FINDING:   LED_SetBlue((now >> 17) & 1);      break;  /* searching */
+        default:                 LED_SetBlue((now >> 15) & 1);      break;  /* reconnecting */
+        }
+
+        {
+            /* RED = health, in strict priority:
+             *
+             *   2Hz blink      IMU DEAD (g_mpu_ok=0) — stabilization silently
+             *                  off, DO NOT FLY. Added 2026-07-16 after a
+             *                  brownout reboot left the IMU down with no sign.
+             *   solid          rotor stopped, gyro zero NOT captured yet —
+             *                  either the first second after power-up or the
+             *                  machine keeps being moved. Wait for the blips.
+             *   ~8Hz flicker   rotor stopped, a zero IS held but the current
+             *                  1s window sees motion (someone's handling it).
+             *                  Flyable; the zero just isn't being refreshed.
+             *   short blip/s   rotor stopped, zero refreshed this second —
+             *                  this is the "calibrated, go" pattern.
+             *   dark           rotor turning — trim frozen, nothing to report.
+             *
+             * Deliberately independent of the link phase: the quietest, best
+             * moment to capture a zero is powered-up-but-TX-still-off, and that
+             * is exactly when red used to be pinned solid by SFHSS_PH_FINDING.
+             *
+             * Before 2026-07-22 red was simply solid whenever disarmed, which
+             * said nothing about whether the pre-takeoff re-zero had ever run.
+             * It hadn't, for a whole session, and that is exactly the failure
+             * this trim exists to prevent. */
+            if (!g_mpu_ok) {
+                LED_SetRed((now >> 17) & 1);
+            } else if (g_motor_slew < 0.05f) {
+                switch (g_gyro_trim_state) {
+                case GT_OK:
+                    /* 1s period (2^20us ~ 1.05s), lit for the first ~1/8 */
+                    LED_SetRed(((now >> 17) & 7u) == 0u);
+                    break;
+                case GT_STALE:
+                    LED_SetRed((now >> 16) & 1);   /* ~8Hz */
+                    break;
+                default:                            /* GT_NONE / GT_MOVING */
+                    LED_SetRed(1);
+                    break;
+                }
+            } else {
+                LED_SetRed(0);
+            }
         }
     }
 }

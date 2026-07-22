@@ -1,4 +1,5 @@
 #include "mpu6500.h"
+#include "spi_rc.h"   /* LED_SetRed: calibration progress indication */
 
 MPU6500_Cal_t g_mpu_cal;
 uint8_t g_mpu_whoami;
@@ -238,22 +239,93 @@ void MPU6500_Init(void) {
     g_mpu_ok = MPU_IS_WHO_AM_I(g_mpu_whoami);
 }
 
+/* STILLNESS-VALIDATED calibration (2026-07-20, rewritten after flight 12).
+ * The old version was a blind 200-sample mean: whatever the airframe did
+ * during those 200 reads went straight into the zero. Flight 12 paid for it —
+ * the machine was being handled at power-up, -7.20 dps of ROTATION was frozen
+ * in as "bias" (true sensor bias ~-0.5), the complementary filter multiplied
+ * that by its 4-second time constant into a 25-deg attitude lie, and the loop
+ * banked the heli hard to make the lie read zero.
+ *
+ * This is the STOCK firmware's scheme (decompiled IMU_CalibrateFull), which
+ * physically cannot capture motion: track a per-axis EMA (1/16, same as
+ * stock), call any sample deviating >CAL_STILL_LSB from it MOTION, and on
+ * motion THROW THE ACCUMULATOR AWAY and start over. Only `samples`
+ * CONSECUTIVE still reads produce a calibration. LED tells the story like
+ * stock's did: slow red blink = accumulating, fast flicker = you moved it,
+ * counting restarted.
+ *
+ * Improvements over stock:
+ *   - hard timeout (stock looped forever; a heli on grass in wind would
+ *     never arm and give no clue why). On timeout: take the EMA as the best
+ *     available bias, set g_gyro_cal_timeout for SWD, and continue — the
+ *     ground auto-trim (orientation.c) re-zeros before takeoff anyway.
+ *   - g_gyro_cal_restarts counts motion events for post-mortem reads.
+ *   - runs under the IWDG.
+ * Threshold: 50 LSB = ~3 dps at 16.4 LSB/dps — an order above gyro noise at
+ * the 20Hz DLPF, far below any real handling of the airframe. */
+#define CAL_STILL_LSB      50
+#define CAL_TIMEOUT_ITERS  4000u   /* ~20s at ~5ms/read; then best-effort */
+
+volatile uint16_t g_gyro_cal_restarts;
+volatile uint8_t  g_gyro_cal_timeout;
+
 void MPU6500_CalibrateGyro(uint16_t samples) {
     int64_t sum_x = 0, sum_y = 0, sum_z = 0;
+    int32_t ema_x = 0, ema_y = 0, ema_z = 0;
+    uint16_t still = 0;
+    uint8_t seeded = 0;
     MPU6500_Raw_t raw;
 
-    for (uint16_t i = 0; i < samples; i++) {
+    g_gyro_cal_restarts = 0;
+    g_gyro_cal_timeout = 0;
+
+    for (uint32_t iter = 0; still < samples; iter++) {
         IWDG_KR = IWDG_REFRESH;
         MPU6500_ReadRaw(&raw);
-        sum_x += raw.gyro_x;
-        sum_y += raw.gyro_y;
-        sum_z += raw.gyro_z;
-        busy_delay(8000); /* ~1ms between samples at 8MHz */
+
+        if (!seeded) {
+            ema_x = raw.gyro_x; ema_y = raw.gyro_y; ema_z = raw.gyro_z;
+            seeded = 1;
+        }
+        int32_t dx = raw.gyro_x - ema_x; if (dx < 0) dx = -dx;
+        int32_t dy = raw.gyro_y - ema_y; if (dy < 0) dy = -dy;
+        int32_t dz = raw.gyro_z - ema_z; if (dz < 0) dz = -dz;
+        ema_x += (raw.gyro_x - ema_x) / 16;
+        ema_y += (raw.gyro_y - ema_y) / 16;
+        ema_z += (raw.gyro_z - ema_z) / 16;
+
+        if (dx > CAL_STILL_LSB || dy > CAL_STILL_LSB || dz > CAL_STILL_LSB) {
+            /* Motion: the whole accumulation is contaminated — discard it. */
+            if (still > 0) g_gyro_cal_restarts++;
+            still = 0;
+            sum_x = sum_y = sum_z = 0;
+            LED_SetRed((iter >> 2) & 1);   /* fast flicker: put it down */
+        } else {
+            sum_x += raw.gyro_x;
+            sum_y += raw.gyro_y;
+            sum_z += raw.gyro_z;
+            still++;
+            LED_SetRed((iter >> 5) & 1);   /* slow blink: measuring, hold */
+        }
+
+        if (iter >= CAL_TIMEOUT_ITERS) {
+            /* Never went still long enough. Best effort (the EMA has been
+             * tracking the low-frequency mean all along), flag it, move on —
+             * refusing to boot forever helps nobody in a field. */
+            g_mpu_cal.gyro_bias_x = ema_x;
+            g_mpu_cal.gyro_bias_y = ema_y;
+            g_mpu_cal.gyro_bias_z = ema_z;
+            g_gyro_cal_timeout = 1;
+            LED_SetRed(1);
+            return;
+        }
     }
 
     g_mpu_cal.gyro_bias_x = (int32_t)(sum_x / samples);
     g_mpu_cal.gyro_bias_y = (int32_t)(sum_y / samples);
     g_mpu_cal.gyro_bias_z = (int32_t)(sum_z / samples);
+    LED_SetRed(1);   /* back to the boot-time power indicator state */
 }
 
 void MPU6500_GetSample(MPU6500_Sample_t *out) {
