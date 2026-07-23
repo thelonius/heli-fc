@@ -20,6 +20,7 @@
 #define CC2500_FSCAL1    0x25
 #define CC2500_PARTNUM   0x30    /* status reg, read with 0xC0 */
 #define CC2500_VERSION   0x31
+#define CC2500_FREQEST   0x32    /* status reg: signed carrier offset estimate */
 #define CC2500_RXBYTES   0x3B    /* status reg: bit7=overflow, bits6-0=count */
 
 /* CC2500 command strobes */
@@ -46,7 +47,7 @@ uint8_t CC2500_ReadStatusReg(uint8_t addr);
 uint8_t CC2500_ReadRxBytes(void);  /* RXBYTES with the read-twice silicon erratum workaround */
 void CC2500_WriteBurst(uint8_t addr, const uint8_t *data, uint8_t len);
 uint8_t CC2500_ReadFIFO(uint8_t *buf, uint8_t len); /* returns chip status byte */
-void CC2500_Reset(void);
+uint8_t CC2500_Reset(void);                         /* 1 = chip reported ready */
 uint8_t CC2500_WaitState(uint8_t state);            /* 1 = reached, 0 = timeout */
 
 /* LEDs: PA6 = blue, PA7 = red (per commit 7629395) */

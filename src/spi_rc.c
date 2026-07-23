@@ -15,13 +15,16 @@ SPI_INLINE void cs_low(void)  { GPIOA_BSRR = (uint32_t)SPI_CS_PIN << 16; }
 SPI_INLINE void cs_high(void) { GPIOA_BSRR = SPI_CS_PIN; }
 
 /* After CS goes low the CC2500 holds SO high until its crystal is running.
- * Keep the full 500 timeout: it's needed for the crystal to settle right after
- * CC2500_Reset(), and cutting it to 64 was measured to leave the chip read back
- * as all-zeros (partnum 0x00 instead of 0x80) — the wake wasn't done yet. In
- * RX/IDLE the crystal is already on, so this returns on the first read and
- * costs nothing during steady polling. */
+ * The timeout must cover the crystal settling right after CC2500_Reset():
+ * cutting it to 64 was measured to leave the chip read back as all-zeros
+ * (partnum 0x00 instead of 0x80) — the wake wasn't done yet. 500 was tuned at
+ * 8MHz; the 48MHz migration silently shortened the same iteration count 6x in
+ * wall time and resurrected exactly that failure on marginal power-ups (the
+ * connect-time deaf/freeze lottery, diagnosed 2026-07-23), so scale it back:
+ * 3000 iterations ~ the original wall time. In RX/IDLE the crystal is already
+ * on, so this exits on the first read and costs nothing during polling. */
 SPI_INLINE void spi_wait_so_low(void) {
-    int timeout = 500;
+    int timeout = 3000;
     while ((GPIOB_IDR & SPI_MISO_PIN) && --timeout);
 }
 
@@ -143,14 +146,27 @@ static void busy_delay(volatile uint32_t n) {
     while (n--);
 }
 
-void CC2500_Reset(void) {
+/* Datasheet §19.1 manual power-on reset, then SRES, then wait for the chip to
+ * report ready. All delays are sized for the 48MHz core (the old constants
+ * were tuned at 8MHz and became 6x shorter in wall time, which is what made
+ * init a lottery on marginal power-ups). Returns 1 when the chip answered
+ * ready, 0 when every wait timed out — the caller must treat 0 as "chip never
+ * came up" and retry, not push config into the void. */
+uint8_t CC2500_Reset(void) {
+    /* Strobe CS as the datasheet asks when XOSC state is unknown: high, low,
+     * high, then >=40us before pulling it low for SRES. */
     cs_high();
-    busy_delay(1000);
-    CC2500_Strobe(CC2500_SRES);
-    busy_delay(8000); /* ~1ms at 8MHz for crystal + reset */
-    for (int i = 0; i < 1000; i++) {
-        if (!(CC2500_Strobe(CC2500_SNOP) & CC2500_STATUS_CHIP_RDYn)) break;
+    busy_delay(2000);   /* ~40us+ */
+    cs_low();
+    busy_delay(2000);
+    cs_high();
+    busy_delay(3000);
+    CC2500_Strobe(CC2500_SRES);       /* Strobe itself waits for SO low */
+    busy_delay(48000);  /* ~1ms: crystal restart + reset to complete */
+    for (int i = 0; i < 6000; i++) {
+        if (!(CC2500_Strobe(CC2500_SNOP) & CC2500_STATUS_CHIP_RDYn)) return 1;
     }
+    return 0;
 }
 
 uint8_t CC2500_WaitState(uint8_t state) {

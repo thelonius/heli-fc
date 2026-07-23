@@ -100,11 +100,51 @@ typedef struct {
     uint32_t lastPollTime;  /* previous SFHSS_Poll entry time, us */
     uint8_t  pollSeen;      /* lastPollTime holds a real sample */
     uint8_t  frameThisSlot; /* >=1 valid frame received in the current slot */
+    /* Cold-start freeze diagnostics (2026-07-23). During the connect-time
+     * freeze only hop channels 0-3 decoded (SWD ring dump) — reception is
+     * FREQUENCY-dependent. These localize it: per-channel tallies plus the
+     * chip's FREQEST offset estimate (1 LSB = 26MHz/2^14 ~ 1.59 kHz), read
+     * once per FIFO drain. Passive: nothing feeds back into tuning.
+     * Offsets (g_sfhss+): rcvByCh 0x152, badByCh 0x18e, festByCh 0x1ca,
+     * festBadByCh 0x1e8, ringFest 0x206, lastFest 0x216. */
+    uint16_t rcvByCh[SFHSS_CHNUM];     /* valid frames per hop index */
+    uint16_t badByCh[SFHSS_CHNUM];     /* marker OK but CRC fail, per hop index */
+    int8_t   festByCh[SFHSS_CHNUM];    /* FREQEST of the last valid frame */
+    int8_t   festBadByCh[SFHSS_CHNUM]; /* FREQEST of the last CRC-fail frame */
+    int8_t   ringFest[16];             /* FREQEST alongside ringDelta/Cmd/Ch */
+    int8_t   lastFest;                 /* FREQEST of the last drain, any outcome */
+    /* S1 sync-ritual diagnostics (2026-07-23, docs/sync_ritual.md):
+     * statAnchorRej +0x218, statHold +0x21a. */
+    uint16_t statAnchorRej;   /* frames whose drain time was too late to anchor */
+    uint16_t statHold;        /* miss-ladder park entries (grid held, radio parked) */
+    /* S2 measured-interval DIAGNOSTIC (does not drive `interval`; see sfhss.c).
+     * intervalMeas = median slot period from prompt DATA1-only reads, us;
+     * 0 = not enough clean samples yet. Read over SWD to watch for TX drift or
+     * a foreign TX. Re-derive offsets from DWARF after any change. */
+    uint16_t intervalMeas;    /* measured slot period, us (0 = unmeasured) */
+    uint8_t  syncCount;       /* accepted samples so far (caps at 16) */
+    uint8_t  lastData1Ok;     /* lastData1 holds a real prompt-DATA1 timestamp */
+    uint32_t lastData1;       /* rtime of the last prompt DATA1, for the delta */
+    uint16_t syncSamp[16];    /* accepted DATA1->DATA1 deltas, us */
 } SFHSS_t;
 
 extern SFHSS_t g_sfhss;
 extern uint8_t g_cc2500_partnum;  /* expect 0x80 */
 extern uint8_t g_cc2500_version;  /* expect 0x03 */
+extern uint8_t g_cc2500_init_tries; /* attempts the last SFHSS_Init needed */
+extern uint8_t g_cc2500_cfg_ok;     /* 1 = config readback verified */
+extern uint8_t g_cc2500_cfg_rb[0x27];
+
+/* Bench knob, poked over SWD (mwb) during a caught connect-freeze to bisect
+ * the mechanism live. Idle = 0 = zero behavior change. Handled at the top of
+ * SFHSS_Poll, self-clears when done:
+ *   1 = full radio re-init (SRES+config+30ch cal; WIPES g_sfhss diagnostics —
+ *       dump them first)
+ *   2 = stock-style per-hop autocal (MCSM0 FS_AUTOCAL=01, +~721us per hop)
+ *   3 = back to boot-cal + manual FSCAL1 restore (MCSM0 autocal off)
+ *   4 = pause IMU I2C traffic (main loop skips sampling)   5 = resume it */
+extern volatile uint8_t g_radio_cmd;
+extern volatile uint8_t g_imu_pause;
 
 void SFHSS_Init(void);            /* reset chip, load config, calibrate 30 channels */
 void SFHSS_Poll(uint32_t now_us); /* call from the main loop as often as possible */
