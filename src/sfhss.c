@@ -5,6 +5,11 @@
 SFHSS_t __attribute__((section(".sfhss_state"))) g_sfhss;
 uint8_t g_cc2500_partnum;
 uint8_t g_cc2500_version;
+uint8_t g_cc2500_init_tries;    /* attempts the last SFHSS_Init needed (1 = clean) */
+uint8_t g_cc2500_cfg_ok;        /* 1 = readback matched sfhss_config byte-for-byte */
+uint8_t g_cc2500_cfg_rb[0x27];  /* last config readback, for SWD forensics */
+volatile uint8_t g_radio_cmd;   /* SWD bench knob — see sfhss.h for the codes */
+volatile uint8_t g_imu_pause;   /* 1 = main loop skips IMU sampling */
 
 /* micros() returns real us but wraps every 1,000,000 us (1s) — see main.c
  * clock_init. All time math here is modulo TIME_WRAP. */
@@ -13,13 +18,50 @@ uint8_t g_cc2500_version;
 
 #define SHORT_INTERVAL      6801u  /* protocol constant: inter-frame period, us */
 #define HOPPING_TIMEOUT     500u   /* us of slack past the expected packet */
-/* Blind grid-hops before falling back to rebind. Flywheel hops stay
- * phase-aligned (crystal drift <=80ppm = ~35us over 64 slots, well inside the
- * window), so riding a long fade costs nothing and any caught frame re-anchors
- * instantly; rebinding instead means a ~200ms camp on channel 0. 64 slots
- * ~435ms sits just under the 500ms failsafe latch: by the time we give up and
- * rebind, the outputs are already in failsafe anyway. */
-#define FALLBACK_COUNT      64
+/* Miss ladder (S1 of docs/sync_ritual.md, 2026-07-23). The flat 64-slot
+ * blind march was the storm engine the bisect convicted: a poisoned grid
+ * rode ~435ms of guaranteed silence into the 500ms failsafe before every
+ * resync. Now: misses 1..HOLD_AT-1 hop blind (ordinary fades), miss HOLD_AT
+ * parks the radio on the channel the grid predicts 2 slots ahead and waits
+ * for the TX to walk into it (statHold counts these), miss FALLBACK_COUNT
+ * (~163ms) gives up to rebind — recovery starts long before failsafe. */
+#define FALLBACK_COUNT      24
+#define HOLD_AT             8      /* miss # that parks instead of hopping */
+
+/* Anchor gate (S1). rtime is the DRAIN time, and the main loop's IMU bursts
+ * delay polls by up to ~3.1ms (maxPollGap) — one late drain used to teleport
+ * the whole grid that far and every following blind hop tuned after the TX
+ * had left. Frames within the gate re-anchor fully; late drains keep their
+ * DATA but only nudge the clock by err/8; wilder outliers are rejected
+ * outright (statAnchorRej). Recovery override: after RECOVER_SKIP misses the
+ * grid itself is the suspect, so any frame re-anchors unconditionally. */
+#define ANCHOR_GATE_US      300
+#define ANCHOR_SOFT_US      2500
+#define RECOVER_SKIP        4
+
+/* S2 SYNC (docs/sync_ritual.md). Measure the real DATA1->DATA1 slot period of
+ * THIS transmitter before trusting the flywheel's blind march. A sample is the
+ * gap between two prompt DATA1-only reads (poll gap < ANCHOR_GATE_US so rtime
+ * is the true arrival), accepted only if it looks like one adjacent slot —
+ * [SYNC_MIN_US, SYNC_MAX_US] rejects double-slots and half-reads. Lock on the
+ * median of SYNC_SAMPLES (robust to the odd late outlier). Measured once per
+ * TX on first acquisition; resyncs reuse the locked value (see FINDING). */
+#define SYNC_MIN_US      6600u
+#define SYNC_MAX_US      7000u
+#define SYNC_SAMPLES     16
+
+/* Median of up to 16 samples via insertion sort on a copy. */
+static uint16_t median_u16(const uint16_t *a, uint8_t n) {
+    uint16_t b[SYNC_SAMPLES];
+    for (uint8_t i = 0; i < n; i++) b[i] = a[i];
+    for (uint8_t i = 1; i < n; i++) {
+        uint16_t k = b[i];
+        int8_t j = (int8_t)i - 1;
+        while (j >= 0 && b[j] > k) { b[j + 1] = b[j]; j--; }
+        b[j + 1] = k;
+    }
+    return b[n / 2];
+}
 
 #define PACKET_LENGTH 15           /* 13 data bytes + RSSI + LQI/CRC_OK */
 
@@ -165,6 +207,9 @@ static void read_packet(void) {
     pktbuf[0] = status;
     g_sfhss.lastFifoStatus = status;
     for (int i = 0; i < PACKET_LENGTH; i++) g_sfhss.lastpkt[i] = pktbuf[1 + i];
+    /* Offset estimate of whatever the demodulator just chewed on. Read here,
+     * before any strobe restarts RX and the estimator with it. */
+    g_sfhss.lastFest = (int8_t)CC2500_ReadStatusReg(CC2500_FREQEST);
 }
 
 static uint8_t parse_packet(uint8_t *cmd) {
@@ -172,7 +217,15 @@ static uint8_t parse_packet(uint8_t *cmd) {
      * don't gate on it — the frame marker and CRC_OK bit fully validate. */
     uint8_t *pkt = &pktbuf[1];
     if (pkt[0] != 0x81) { g_sfhss.statNoMarker++; return 0; } /* S-FHSS frame marker */
-    if (!(pkt[14] & 0x80)) { g_sfhss.statNoCrc++; return 0; } /* appended LQI: CRC_OK */
+    if (!(pkt[14] & 0x80)) {                                  /* appended LQI: CRC_OK */
+        g_sfhss.statNoCrc++;
+        /* Marker present = a real TX packet that garbled. Where and how far off? */
+        if (g_sfhss.ch < SFHSS_CHNUM) {
+            g_sfhss.badByCh[g_sfhss.ch]++;
+            g_sfhss.festBadByCh[g_sfhss.ch] = g_sfhss.lastFest;
+        }
+        return 0;
+    }
 
     int32_t txaddr = ((int32_t)pkt[1] << 8) | pkt[2];
     uint8_t hopcode = (uint8_t)(((pkt[11] & 0x07) << 2) | ((pkt[12] & 0xC0) >> 6));
@@ -216,7 +269,13 @@ static uint8_t parse_packet(uint8_t *cmd) {
     g_sfhss.ringDelta[ri] = elapsed(g_sfhss.lastFrameTime, g_sfhss.rtime);
     g_sfhss.ringCmd[ri]   = *cmd;
     g_sfhss.ringCh[ri]    = g_sfhss.ch;
+    g_sfhss.ringFest[ri]  = g_sfhss.lastFest;
     g_sfhss.ringIdx++;
+
+    if (g_sfhss.ch < SFHSS_CHNUM) {
+        g_sfhss.rcvByCh[g_sfhss.ch]++;
+        g_sfhss.festByCh[g_sfhss.ch] = g_sfhss.lastFest;
+    }
 
     g_sfhss.lastFrameTime = g_sfhss.rtime;
     g_sfhss.sigLost = 0;   /* only a real frame revives HasSignal() */
@@ -278,12 +337,34 @@ void SFHSS_Init(void) {
     g_sfhss.data[2] = 880; /* throttle low until first frame */
     g_sfhss.txaddr = -1;
 
-    CC2500_Reset();
-    for (volatile uint32_t d = 0; d < 64000; d++);  /* ~8ms at 8MHz */
-    g_cc2500_partnum = CC2500_ReadStatusReg(CC2500_PARTNUM);
-    g_cc2500_version = CC2500_ReadStatusReg(CC2500_VERSION);
+    /* Init lottery fix (2026-07-23). On marginal power-ups the chip needs
+     * longer than the old fixed delays, and the config burst went into a chip
+     * that wasn't listening: whichever registers dropped decided the symptom —
+     * sync word lost = deaf boot, modem regs lost = the connect-time freeze
+     * with only a few hop channels alive. So: reset until the chip reports
+     * ready, prove identity (PARTNUM/VERSION), write config, read every byte
+     * back, and redo the whole dance on any mismatch. State is SWD-visible:
+     * g_cc2500_init_tries, g_cc2500_cfg_ok, g_cc2500_cfg_rb[]. */
+    g_cc2500_cfg_ok = 0;
+    for (uint8_t try = 0; try < 8 && !g_cc2500_cfg_ok; try++) {
+        IWDG_KR = IWDG_REFRESH;
+        g_cc2500_init_tries = (uint8_t)(try + 1);
+        uint8_t ready = CC2500_Reset();
+        for (volatile uint32_t d = 0; d < 100000; d++);  /* ~2ms at 48MHz */
+        g_cc2500_partnum = CC2500_ReadStatusReg(CC2500_PARTNUM);
+        g_cc2500_version = CC2500_ReadStatusReg(CC2500_VERSION);
+        if (!ready || g_cc2500_partnum != 0x80 || g_cc2500_version != 0x03)
+            continue;
 
-    CC2500_WriteBurst(0x00, sfhss_config, sizeof(sfhss_config));
+        CC2500_WriteBurst(0x00, sfhss_config, sizeof(sfhss_config));
+        g_cc2500_cfg_ok = 1;
+        for (uint8_t i = 0; i < sizeof(sfhss_config); i++) {
+            g_cc2500_cfg_rb[i] = CC2500_ReadReg(i);
+            if (g_cc2500_cfg_rb[i] != sfhss_config[i]) g_cc2500_cfg_ok = 0;
+        }
+    }
+    /* After 8 failed rounds we still proceed — outputs stay in failsafe and
+     * the SWD-visible state says exactly what happened. */
 
     /* Per-channel synthesizer calibration (autocal is disabled) */
     for (uint8_t i = 0; i < SFHSS_CHNUM; i++) {
@@ -340,13 +421,25 @@ uint8_t SFHSS_HasSignal(uint32_t now) {
 void SFHSS_Poll(uint32_t now) {
     now &= TIME_MASK;
 
+    /* Bench knob (SWD), see sfhss.h. Self-clears so one poke = one action. */
+    if (g_radio_cmd) {
+        uint8_t c = g_radio_cmd;
+        g_radio_cmd = 0;
+        if (c == 1) { SFHSS_Init(); return; }
+        else if (c == 2) CC2500_WriteReg(0x18, 0x18); /* MCSM0: FS_AUTOCAL=01 */
+        else if (c == 3) CC2500_WriteReg(0x18, 0x08); /* MCSM0: autocal off */
+        else if (c == 4) g_imu_pause = 1;
+        else if (c == 5) g_imu_pause = 0;
+    }
+
     /* Poll-cadence instrumentation: the bench shows DATA1+DATA2 almost always
      * drained by ONE poll, which requires a >=1.6ms gap between polls — yet no
      * code path obviously blocks that long. Record the worst gap so the theory
      * is measurable over SWD instead of argued about. */
+    uint32_t pollGap = 0xFFFFFFFFu;   /* huge until we have a real prior sample */
     if (g_sfhss.pollSeen) {
-        uint32_t gap = elapsed(g_sfhss.lastPollTime, now);
-        if (gap > g_sfhss.maxPollGap) g_sfhss.maxPollGap = gap;
+        pollGap = elapsed(g_sfhss.lastPollTime, now);
+        if (pollGap > g_sfhss.maxPollGap) g_sfhss.maxPollGap = pollGap;
     }
     g_sfhss.lastPollTime = now;
     g_sfhss.pollSeen = 1;
@@ -445,6 +538,7 @@ void SFHSS_Poll(uint32_t now) {
             }
             g_sfhss.frameThisSlot = 0;
 #endif
+            g_sfhss.lastData1Ok = 0;   /* stale across the acquisition gap */
             g_sfhss.phase = SFHSS_PH_CONNECTED;
         } else if (res == 2) {
             rx_restart();
@@ -538,16 +632,56 @@ void SFHSS_Poll(uint32_t now) {
         if (res == 1) {
             if (!g_sfhss.frameThisSlot) g_sfhss.statRcv++;  /* once per slot */
             g_sfhss.frameThisSlot = 1;
+            uint16_t hadSkip = g_sfhss.skipCount;
             g_sfhss.skipCount = 0;
-            /* Re-anchor the grid on measured timing (cancels crystal drift).
-             * A drain containing DATA2 happened at/after DATA2-complete —
-             * SLOT_DATA2_OFFSET_US later than a prompt DATA1 read; correct for
-             * that so a late read doesn't drag the grid late. */
-            if (got_data1 && !got_data2)
-                g_sfhss.slotStart = g_sfhss.rtime;
-            else
-                g_sfhss.slotStart =
-                    (g_sfhss.rtime + TIME_WRAP - SLOT_DATA2_OFFSET_US) % TIME_WRAP;
+            /* Candidate anchor from measured timing. A drain containing DATA2
+             * happened at/after DATA2-complete — SLOT_DATA2_OFFSET_US later
+             * than a prompt DATA1 read; correct for that. */
+            uint32_t cand = (got_data1 && !got_data2)
+                ? g_sfhss.rtime
+                : (g_sfhss.rtime + TIME_WRAP - SLOT_DATA2_OFFSET_US) % TIME_WRAP;
+            /* Anchor gate (S1): trust the grid over one late drain — unless
+             * we were just blind-marching, then trust the frame instead. */
+            int32_t err = since_signed(g_sfhss.slotStart, cand);
+            int32_t mag = err < 0 ? -err : err;
+            if (hadSkip >= RECOVER_SKIP || mag < ANCHOR_GATE_US) {
+                g_sfhss.slotStart = cand;               /* full re-anchor */
+            } else if (mag < ANCHOR_SOFT_US) {
+                g_sfhss.slotStart = (uint32_t)(g_sfhss.slotStart + TIME_WRAP
+                                    + (uint32_t)(err / 8)) % TIME_WRAP;
+            } else {
+                g_sfhss.statAnchorRej++;                /* data used, clock kept */
+            }
+            /* S2 (DIAGNOSTIC ONLY — does NOT feed `interval`). Measure this
+             * TX's DATA1->DATA1 period from PROMPT DATA1-only reads: rtime is
+             * then the true DATA1 arrival with no DATA2 trail to subtract, so
+             * the sample carries no 1625us-normalization bias (the combined-
+             * drain `cand` route was tried and drifted the median ~24us low).
+             * Median of 16 → intervalMeas, readable over SWD.
+             *
+             * Why it does not drive the flywheel: this bench measured 6803us,
+             * i.e. the hardcoded 6801 is already accurate to ~2us — better than
+             * a live measurement achieves — and the 2026-07-23 bisect pinned
+             * the freezes on the anchor teleport (fixed in S1), not on interval
+             * error. Feeding a noisier live number would only add risk. Kept as
+             * a drift / foreign-TX watch and the seed for a future S3 EMA.
+             * Samples need clean prompt reads, which are scarce; if they never
+             * accumulate, intervalMeas stays 0 (honest "unknown") and nothing
+             * downstream cares. */
+            if (!g_sfhss.intervalMeas &&
+                got_data1 && !got_data2 && pollGap < ANCHOR_GATE_US) {
+                if (g_sfhss.lastData1Ok) {
+                    uint32_t d = elapsed(g_sfhss.lastData1, g_sfhss.rtime);
+                    if (d >= SYNC_MIN_US && d <= SYNC_MAX_US &&
+                        g_sfhss.syncCount < SYNC_SAMPLES) {
+                        g_sfhss.syncSamp[g_sfhss.syncCount++] = (uint16_t)d;
+                    }
+                }
+                g_sfhss.lastData1 = g_sfhss.rtime;
+                g_sfhss.lastData1Ok = 1;
+                if (g_sfhss.syncCount >= SYNC_SAMPLES)
+                    g_sfhss.intervalMeas = median_u16(g_sfhss.syncSamp, SYNC_SAMPLES);
+            }
         } else if (res == 2) {
             rx_restart();               /* bad read: keep listening here */
         }
@@ -555,6 +689,7 @@ void SFHSS_Poll(uint32_t now) {
         if (since_signed(g_sfhss.slotStart, now) > (int32_t)SLOT_2ND_WINDOW_US) {
             if (!g_sfhss.frameThisSlot) {
                 g_sfhss.statLost++;
+                g_sfhss.lastData1Ok = 0;   /* gap: don't pair across a miss */
                 if (++g_sfhss.skipCount >= FALLBACK_COUNT) {
                     g_sfhss.statResync++;
                     g_sfhss.phase = SFHSS_PH_BINDED; /* keep txaddr, re-acquire */
@@ -562,8 +697,20 @@ void SFHSS_Poll(uint32_t now) {
                 }
             }
             g_sfhss.frameThisSlot = 0;
-            next_channel();
-            hop_flush();
+            /* Miss ladder: normal hop below HOLD_AT; at HOLD_AT park 2 slots
+             * ahead of the grid and sit; past it stay parked (the slot clock
+             * keeps ticking so a caught frame re-anchors sanely). */
+            if (g_sfhss.skipCount < HOLD_AT) {
+                next_channel();
+                hop_flush();
+            } else if (g_sfhss.skipCount == HOLD_AT) {
+                next_channel();
+                next_channel();
+                next_channel();
+                hop_flush();
+                g_sfhss.statHold++;
+            }
+            /* skipCount in (HOLD_AT, FALLBACK_COUNT): parked — no retune */
             g_sfhss.slotStart = (g_sfhss.slotStart + g_sfhss.interval) % TIME_WRAP;
         }
         break;
